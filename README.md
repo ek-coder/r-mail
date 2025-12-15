@@ -126,6 +126,3 @@ The app will open at `http://localhost:3000` (or `3001` if busy).
 
 ---
 
-## License
-
-[MIT License](LICENSE)
