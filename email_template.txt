@@ -1,0 +1,24 @@
+Subject: Internship Application – {{ position | default("Software Engineer Intern") }}
+
+Dear {{ company_name | default("HR Team") }},
+
+I hope you're doing well.
+
+I'm Lakshay Verma, currently pursuing B.Tech in Computer Science and Engineering at SRM Institute of Science & Technology. 
+I’m reaching out to express my keen interest in a {{ position | default("Software Engineering internship") }} opportunity with {{ company_name | default("your organization") }}.
+
+Through my recent projects — including AI Doctor Chatbot (AI-powered medical assistant) and Police Bot (React-based legal assistance system) — 
+I’ve developed strong experience in full-stack development, AI integration, and data-driven system design using React, Python (Flask), and MySQL.
+
+I would love the opportunity to contribute as a {{ position | default("Software Engineer Intern") }}, applying my technical skills to build impactful and scalable solutions. 
+My resume is attached for your review.
+
+Thank you for your time and consideration. I’d be glad to discuss how my skills align with {{ company_name | default("your organization") }}’s current projects and objectives.
+
+Warm regards,  
+Lakshay Verma  
+B.Tech (Computer Science and Engineering)  
+SRM Institute of Science & Technology  
+Email: lakshayv133@gmail.com
+LinkedIn: https://www.linkedin.com/in/ek-coder/  
+GitHub: https://github.com/ek-coder
