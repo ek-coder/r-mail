@@ -18,6 +18,7 @@ from datetime import datetime
 # Removed PyPDF2 import
 # Removed scraping imports
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -29,7 +30,21 @@ import email.utils
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max upload size
+
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({"error": "File too large. Maximum allowed upload size is 16 MB."}), 413
 
 # Configuration
 from werkzeug.utils import secure_filename
@@ -91,19 +106,35 @@ def save_emails(emails_data):
         json.dump(emails_data, f, indent=2)
 
 def get_gmail_service():
-    """Get Gmail API service instance"""
+    """Get Gmail API service instance, refreshing expired OAuth tokens when possible"""
     creds = None
     if os.path.exists(CREDENTIALS_FILE):
-        creds = Credentials.from_authorized_user_file(CREDENTIALS_FILE, SCOPES)
-    
-    if not creds or not creds.valid:
+        try:
+            creds = Credentials.from_authorized_user_file(CREDENTIALS_FILE, SCOPES)
+        except Exception as e:
+            print(f"Error loading Gmail credentials file: {type(e).__name__}")
+            return None
+
+    if not creds:
         return None
-    
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                with open(CREDENTIALS_FILE, 'w') as token_file:
+                    token_file.write(creds.to_json())
+            except Exception as e:
+                print(f"Error refreshing Gmail credentials: {type(e).__name__}")
+                return None
+        else:
+            return None
+
     try:
         service = build('gmail', 'v1', credentials=creds)
         return service
     except Exception as e:
-        print(f"Error building Gmail service: {e}")
+        print(f"Error building Gmail service: {type(e).__name__}")
         return None
 
 def extract_template_subject_pattern():
@@ -244,45 +275,62 @@ def upload_resume():
     """Upload resume and extract metadata"""
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
-    
+
     file = request.files['file']
-    if file.filename == '':
+    if not file or not file.filename or file.filename.strip() == '':
         return jsonify({"error": "No file selected"}), 400
-    
-    if file and file.filename.endswith('.pdf'):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(RESUME_FOLDER, filename)
-        file.save(filepath)
-        
-        # Determine file size
-        file_size = os.path.getsize(filepath)
-        size_str = f"{file_size / 1024:.1f} KB"
-        if file_size > 1024 * 1024:
-            size_str = f"{file_size / (1024 * 1024):.1f} MB"
-        
-        return jsonify({
-            "success": True,
-            "filename": filename,
-            "filepath": filepath,
-            "size": size_str,
-            "uploadedAt": datetime.now().isoformat()
-        })
-    
-    return jsonify({"error": "Invalid file type. Only PDF allowed"}), 400
+
+    filename = secure_filename(file.filename)
+    if not filename or not filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Invalid file type. Only PDF allowed"}), 400
+
+    # Verify PDF magic header bytes (%PDF-)
+    header = file.stream.read(5)
+    file.stream.seek(0)
+    if header != b'%PDF-':
+        return jsonify({"error": "Invalid PDF file content"}), 400
+
+    filepath = os.path.join(RESUME_FOLDER, filename)
+    file.save(filepath)
+
+    # Determine file size
+    file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        os.remove(filepath)
+        return jsonify({"error": "Uploaded PDF file is empty"}), 400
+
+    size_str = f"{file_size / 1024:.1f} KB"
+    if file_size > 1024 * 1024:
+        size_str = f"{file_size / (1024 * 1024):.1f} MB"
+
+    uploaded_at = datetime.now().isoformat()
+    return jsonify({
+        "success": True,
+        "name": filename,
+        "filename": filename,
+        "filepath": filepath,
+        "size": size_str,
+        "uploadedAt": uploaded_at,
+        "metadata": None
+    })
 
 @app.route('/api/resume', methods=['GET'])
 def get_resume():
     """Get current resume info"""
-    resumes = [f for f in os.listdir(RESUME_FOLDER) if f.endswith('.pdf')]
+    resumes = [f for f in os.listdir(RESUME_FOLDER) if f.lower().endswith('.pdf')]
     if resumes:
         latest_resume = max(resumes, key=lambda f: os.path.getmtime(os.path.join(RESUME_FOLDER, f)))
         filepath = os.path.join(RESUME_FOLDER, latest_resume)
         # metadata = extract_resume_metadata_with_gemini(filepath)
         file_size = os.path.getsize(filepath)
         size_str = f"{file_size / 1024:.1f} KB"
-        
+        if file_size > 1024 * 1024:
+            size_str = f"{file_size / (1024 * 1024):.1f} MB"
+
         return jsonify({
             "name": latest_resume,
+            "filename": latest_resume,
+            "filepath": filepath,
             "size": size_str,
             "uploadedAt": datetime.fromtimestamp(os.path.getmtime(filepath)).isoformat(),
             "metadata": None
@@ -293,7 +341,10 @@ def get_resume():
 @app.route('/api/resume/<filename>', methods=['DELETE'])
 def delete_resume(filename):
     """Delete resume"""
-    filepath = os.path.join(RESUME_FOLDER, secure_filename(filename))
+    safe_name = secure_filename(filename)
+    if not safe_name or not safe_name.lower().endswith('.pdf'):
+        return jsonify({"error": "Invalid filename"}), 400
+    filepath = os.path.join(RESUME_FOLDER, safe_name)
     if os.path.exists(filepath):
         os.remove(filepath)
         return jsonify({"success": True})
@@ -506,46 +557,65 @@ def get_analytics():
         "replyRate": (total_replied / total_sent * 100) if total_sent > 0 else 0
     })
 
+def _clean_cell_value(val):
+    """Convert pandas cell value to clean string, handling NaN/None"""
+    if val is None or pd.isna(val):
+        return ""
+    return str(val).strip()
+
 @app.route('/api/recipients/upload', methods=['POST'])
 def upload_recipients():
     """Upload recipients CSV/Excel file"""
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
-    
+
     file = request.files['file']
-    if file.filename == '':
+    if not file or not file.filename or file.filename.strip() == '':
         return jsonify({"error": "No file selected"}), 400
-    
+
     try:
         filename = secure_filename(file.filename)
+        lower_name = filename.lower()
+        if not filename or not lower_name.endswith(('.csv', '.xlsx', '.xls')):
+            return jsonify({"error": "Unsupported file type. Use CSV or Excel files."}), 400
+
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
-        
+
+        if os.path.getsize(filepath) == 0:
+            os.remove(filepath)
+            return jsonify({"error": "Uploaded file is empty."}), 400
+
         # Read CSV or Excel
         try:
-            if filename.endswith('.csv'):
+            if lower_name.endswith('.csv'):
                 df = pd.read_csv(filepath)
-            elif filename.endswith(('.xlsx', '.xls')):
+            elif lower_name.endswith(('.xlsx', '.xls')):
                 df = pd.read_excel(filepath, engine='openpyxl')
             else:
                 return jsonify({"error": "Unsupported file type. Use CSV or Excel files."}), 400
         except Exception as e:
             return jsonify({"error": f"Error reading file: {str(e)}"}), 400
-        
+
         # Extract recipients
         recipients = []
         for _, row in df.iterrows():
-            email = str(row.get("Email", row.get("email", ""))).strip()
-            if email and "@" in email:
+            raw_email = row.get("Email") if "Email" in row and not pd.isna(row.get("Email")) else row.get("email", "")
+            email_addr = _clean_cell_value(raw_email)
+            if email_addr and "@" in email_addr and not any(ch in email_addr for ch in ('\r', '\n', ' ')):
+                raw_company = row.get("Company Name") if "Company Name" in row and not pd.isna(row.get("Company Name")) else row.get("company", "")
+                raw_industry = row.get("Industry") if "Industry" in row and not pd.isna(row.get("Industry")) else row.get("industry", "")
+                raw_position = row.get("Position") if "Position" in row and not pd.isna(row.get("Position")) else row.get("position", "")
+                raw_location = row.get("Location") if "Location" in row and not pd.isna(row.get("Location")) else row.get("location", "")
                 recipient = {
-                    "email": email,
-                    "company": str(row.get("Company Name", row.get("company", ""))).strip(),
-                    "industry": str(row.get("Industry", row.get("industry", ""))).strip(),
-                    "position": str(row.get("Position", row.get("position", ""))).strip(),
-                    "location": str(row.get("Location", row.get("location", ""))).strip()
+                    "email": email_addr,
+                    "company": _clean_cell_value(raw_company),
+                    "industry": _clean_cell_value(raw_industry),
+                    "position": _clean_cell_value(raw_position),
+                    "location": _clean_cell_value(raw_location)
                 }
                 recipients.append(recipient)
-        
+
         return jsonify({
             "success": True,
             "recipients": recipients,
@@ -590,22 +660,40 @@ def gmail_auth():
     """Initiate Gmail OAuth flow"""
     try:
         if not os.path.exists(CLIENT_SECRETS_FILE):
-            error_msg = f"Gmail API credentials not found. Please:\n1. Go to Google Cloud Console\n2. Enable Gmail API\n3. Create OAuth 2.0 credentials\n4. Download as 'client_secret.json'\n5. Place it in: {os.path.abspath('.')}"
-            print(f"ERROR: {error_msg}")
+            error_msg = (
+                "Gmail API credentials not found. Please:\n"
+                "1. Go to Google Cloud Console\n"
+                "2. Enable Gmail API\n"
+                "3. Create OAuth 2.0 credentials\n"
+                "4. Download as 'client_secret.json'\n"
+                f"5. Place it in: {os.path.abspath('.')}"
+            )
             return jsonify({"error": error_msg}), 400
-        
-        # Get redirect URI
+
         redirect_uri = request.host_url.rstrip('/') + '/api/gmail/callback'
-        print(f"Using redirect URI: {redirect_uri}")
-        
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri=redirect_uri
-    )
-    
-    auth_url, _ = flow.authorization_url(prompt='consent')
-    return jsonify({"auth_url": auth_url})
+
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            redirect_uri=redirect_uri
+        )
+
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'  # Force consent screen to get refresh token
+        )
+
+        return jsonify({
+            "auth_url": authorization_url,
+            "state": state
+        })
+    except FileNotFoundError:
+        error_msg = f"File not found: {CLIENT_SECRETS_FILE}. Please add client_secret.json to the project root."
+        return jsonify({"error": error_msg}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to initiate Gmail authentication: {str(e)}"}), 500
+
 
 @app.route('/api/email/send', methods=['POST'])
 def send_single_email():
@@ -614,17 +702,20 @@ def send_single_email():
         sender_email = os.getenv("SENDER_EMAIL")
         app_password = os.getenv("APP_PASSWORD")
         sender_name = os.getenv("SENDER_NAME", "R-Mail User")
-        
+
         if not sender_email or not app_password:
             return jsonify({"error": "Email credentials not configured in .env"}), 400
 
         data = request.form
-        to_email = data.get('to')
-        subject = data.get('subject')
-        body = data.get('body')
-        
+        to_email = (data.get('to') or '').strip()
+        subject = (data.get('subject') or '').strip()
+        body = data.get('body') or ''
+
         if not to_email or not subject:
             return jsonify({"error": "Recipient and Subject are required"}), 400
+
+        if '@' not in to_email or any(ch in to_email for ch in ('\r', '\n')) or any(ch in subject for ch in ('\r', '\n')):
+            return jsonify({"error": "Invalid recipient email or subject"}), 400
 
         # Create message
         msg = MIMEMultipart()
@@ -637,16 +728,16 @@ def send_single_email():
         if 'files' in request.files:
             files = request.files.getlist('files')
             for file in files:
-                if file.filename:
+                if file and file.filename:
                     filename = secure_filename(file.filename)
-                    # Use a temporary path if needed, or just read into memory
-                    # For simplicity, we can read the stream directly
+                    if not filename:
+                        continue
                     part = MIMEBase('application', 'octet-stream')
                     part.set_payload(file.read())
                     encoders.encode_base64(part)
                     part.add_header(
                         'Content-Disposition',
-                        f'attachment; filename= {filename}',
+                        f'attachment; filename="{filename}"',
                     )
                     msg.attach(part)
 
@@ -654,56 +745,29 @@ def send_single_email():
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(sender_email, app_password)
             server.send_message(msg)
-            
-        # Log to sent_log.csv if it exists (optional, or create new log)
-        # We can also add it to emails.json 'sent' list
-        
+
         # Save to local storage (emails.json)
         emails_data = load_emails()
         new_email = {
             "id": f"sent_{int(time.time()*1000)}",
             "sender": "Me",
+            "email": to_email,
             "subject": subject,
             "preview": body[:50] + "..." if len(body) > 50 else body,
             "time": datetime.now().strftime("%I:%M %p"),
+            "date": datetime.now().isoformat(),
             "read": True,
             "starred": False,
             "folder": "sent",
             "body": body
         }
-        emails_data['sent'].insert(0, new_email)
+        emails_data.setdefault('sent', []).insert(0, new_email)
         save_emails(emails_data)
 
         return jsonify({"success": True, "message": "Email sent successfully"})
 
     except Exception as e:
-        print(f"Error sending email: {e}")
-        return jsonify({"error": str(e)}), 500        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRETS_FILE,
-            scopes=SCOPES,
-            redirect_uri=redirect_uri
-        )
-        
-        authorization_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true',
-            prompt='consent'  # Force consent screen to get refresh token
-        )
-        
-        print(f"Authorization URL generated successfully")
-        return jsonify({
-            "auth_url": authorization_url,
-            "state": state
-        })
-    except FileNotFoundError:
-        error_msg = f"File not found: {CLIENT_SECRETS_FILE}. Please add client_secret.json to the project root."
-        print(f"ERROR: {error_msg}")
-        return jsonify({"error": error_msg}), 400
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"Gmail auth error: {error_details}")
-        return jsonify({"error": f"Failed to initiate Gmail authentication: {str(e)}"}), 500
+        return jsonify({"error": f"Failed to send email: {str(e)}"}), 500
 
 @app.route('/api/gmail/callback', methods=['GET'])
 def gmail_callback():
@@ -712,37 +776,48 @@ def gmail_callback():
         code = request.args.get('code')
         state = request.args.get('state')
         error = request.args.get('error')
-        
+
         if error:
             return jsonify({"error": f"Authorization failed: {error}"}), 400
-        
+
         if not code:
             return jsonify({"error": "Authorization code not provided"}), 400
-        
+
+        if not os.path.exists(CLIENT_SECRETS_FILE):
+            return jsonify({"error": f"File not found: {CLIENT_SECRETS_FILE}"}), 400
+
         redirect_uri = request.host_url.rstrip('/') + '/api/gmail/callback'
-        print(f"Callback received. Redirect URI: {redirect_uri}")
-        
+
         flow = Flow.from_client_secrets_file(
             CLIENT_SECRETS_FILE,
             scopes=SCOPES,
+            state=state,
             redirect_uri=redirect_uri
         )
-        
+
         flow.fetch_token(code=code)
         creds = flow.credentials
-        
+
         # Save credentials
         with open(CREDENTIALS_FILE, 'w') as token:
             token.write(creds.to_json())
-        
-        print("Gmail credentials saved successfully")
-        # Redirect to frontend with success message
-        frontend_url = request.host_url.replace(':5001', ':3000').rstrip('/')
-        return f'<html><body><script>window.opener.postMessage({{type: "gmail_connected", success: true}}, "*"); window.close();</script><p>Gmail connected successfully! You can close this window.</p></body></html>', 200
+
+        # Redirect / notify frontend with success message without exposing tokens
+        frontend_url = os.getenv("FRONTEND_URL", request.host_url.replace(':5001', ':3000').rstrip('/'))
+        safe_frontend_url = json.dumps(frontend_url)
+        return (
+            '<html><body><script>'
+            f'var targetOrigin = {safe_frontend_url};'
+            'if (window.opener) {'
+            '  window.opener.postMessage({type: "gmail_connected", success: true}, targetOrigin);'
+            '  window.close();'
+            '} else {'
+            '  window.location.href = targetOrigin;'
+            '}'
+            '</script><p>Gmail connected successfully! Redirecting...</p></body></html>',
+            200
+        )
     except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"Gmail callback error: {error_details}")
         return jsonify({"error": f"Failed to complete Gmail authentication: {str(e)}"}), 500
 
 @app.route('/api/gmail/status', methods=['GET'])
@@ -965,12 +1040,18 @@ def send_composed_email():
         
         # Add attachments
         for attachment_path in attachments:
-            if os.path.exists(attachment_path):
-                with open(attachment_path, "rb") as f:
+            if not attachment_path:
+                continue
+            resolved_path = os.path.abspath(attachment_path)
+            allowed_dirs = (os.path.abspath(UPLOAD_FOLDER), os.path.abspath(RESUME_FOLDER))
+            if not any(resolved_path.startswith(d + os.sep) for d in allowed_dirs):
+                return jsonify({"error": "Invalid attachment path"}), 400
+            if os.path.exists(resolved_path) and os.path.isfile(resolved_path):
+                with open(resolved_path, "rb") as f:
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(f.read())
                 encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f'attachment; filename="{Path(attachment_path).name}"')
+                part.add_header("Content-Disposition", f'attachment; filename="{Path(resolved_path).name}"')
                 msg.attach(part)
         
         # Send email
@@ -1021,16 +1102,18 @@ def upload_compose_attachment():
     """Upload attachment for compose window"""
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
-    
+
     file = request.files['file']
-    if file.filename == '':
+    if not file or not file.filename or file.filename.strip() == '':
         return jsonify({"error": "No file selected"}), 400
-    
+
     try:
         filename = secure_filename(file.filename)
+        if not filename:
+            return jsonify({"error": "Invalid filename"}), 400
         filepath = os.path.join(UPLOAD_FOLDER, f"compose_{int(time.time())}_{filename}")
         file.save(filepath)
-        
+
         return jsonify({
             "success": True,
             "filepath": filepath,
@@ -1055,5 +1138,6 @@ def delete_draft(draft_id):
     return jsonify({"success": True})
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
+    app.run(host="127.0.0.1", debug=debug_mode, port=5001)
 
